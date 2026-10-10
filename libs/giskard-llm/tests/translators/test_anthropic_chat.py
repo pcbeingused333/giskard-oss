@@ -13,6 +13,9 @@ from giskard.llm.types import (
     ChatMessage,
     DeveloperMessage,
     FunctionMessage,
+    ReasoningEncryptedDetail,
+    ReasoningSummaryDetail,
+    ReasoningTextDetail,
     RefusalContent,
     SystemMessage,
     TextContent,
@@ -191,6 +194,48 @@ def test_assistant_refusal_replayed_as_text_block():
             "content": [{"type": "text", "text": "I can't help with that."}],
         },
     ]
+    validate_anthropic_message_create(payload)
+
+
+def test_assistant_reasoning_replayed_as_leading_thinking_blocks():
+    """Anthropic reasoning details lead the turn as thinking blocks, so tool use with
+    thinking enabled keeps working; other providers' reasoning is not replayed."""
+    messages: list[ChatMessage] = [
+        UserMessage(content="Weather in Paris?"),
+        AssistantMessage(
+            content="Checking.",
+            reasoning="I should check the weather.",
+            reasoning_details=[
+                ReasoningTextDetail(
+                    text="I should check the weather.",
+                    signature="sig_xyz",
+                    format="anthropic-claude-v1",
+                ),
+                ReasoningEncryptedDetail(data="opaque", format="anthropic-claude-v1"),
+                ReasoningTextDetail(text="Unsigned.", format="anthropic-claude-v1"),
+                ReasoningSummaryDetail(
+                    summary="Summary.", format="anthropic-claude-v1"
+                ),
+                ReasoningTextDetail(
+                    text="Another provider.", signature="s", format="openai-o1-v1"
+                ),
+            ],
+        ),
+        UserMessage(content="Thanks."),
+    ]
+    payload = AnthropicChatTranslator.to_anthropic(_MODEL, messages)
+    assert payload["messages"][1] == {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": "I should check the weather.",
+                "signature": "sig_xyz",
+            },
+            {"type": "redacted_thinking", "data": "opaque"},
+            {"type": "text", "text": "Checking."},
+        ],
+    }
     validate_anthropic_message_create(payload)
 
 

@@ -12,7 +12,11 @@ pytest.importorskip("anthropic")
 
 from anthropic.types import Message
 from giskard.llm.translators.anthropic import AnthropicChatTranslator
-from giskard.llm.types import TextContent
+from giskard.llm.types import (
+    ReasoningEncryptedDetail,
+    ReasoningTextDetail,
+    TextContent,
+)
 
 pytestmark = pytest.mark.anthropic
 
@@ -165,23 +169,22 @@ def test_from_anthropic_refusal_category_only():
     assert msg.is_refusal
 
 
-@pytest.mark.parametrize(
-    ("block", "block_type"),
-    [
-        ({"type": "thinking", "thinking": "Hmm.", "signature": "sig"}, "thinking"),
-        ({"type": "redacted_thinking", "data": "opaque"}, "redacted_thinking"),
-    ],
-)
-def test_from_anthropic_unsupported_block_raises(
-    block: dict[str, object], block_type: str
-):
+_SERVER_TOOL_USE = {
+    "type": "server_tool_use",
+    "id": "srvtoolu_01",
+    "name": "web_search",
+    "input": {"query": "weather"},
+}
+
+
+def test_from_anthropic_unsupported_block_raises():
     """Blocks we cannot represent raise :class:`UnsupportedContentError` by default."""
     from giskard.llm.errors import UnsupportedContentError
 
-    raw = _message({"content": [block, {"type": "text", "text": "Answer."}]})
+    raw = _message({"content": [_SERVER_TOOL_USE, {"type": "text", "text": "Answer."}]})
     with pytest.raises(UnsupportedContentError) as exc_info:
         AnthropicChatTranslator.from_anthropic(raw)
-    assert exc_info.value.content_type == block_type
+    assert exc_info.value.content_type == "server_tool_use"
     assert exc_info.value.provider == "anthropic"
 
 
@@ -192,7 +195,7 @@ def test_from_anthropic_unsupported_block_dropped_with_warning(
     raw = _message(
         {
             "content": [
-                {"type": "thinking", "thinking": "Hmm.", "signature": "sig"},
+                _SERVER_TOOL_USE,
                 {"type": "text", "text": "Answer."},
             ]
         }
@@ -204,4 +207,76 @@ def test_from_anthropic_unsupported_block_dropped_with_warning(
             .message
         )
     assert msg.content == [TextContent(text="Answer.")]
-    assert "thinking" in caplog.text
+    assert "server_tool_use" in caplog.text
+
+
+def test_from_anthropic_thinking_becomes_reasoning():
+    """``thinking`` maps to a signed ``reasoning.text`` detail, kept out of ``content``."""
+    raw = _message(
+        {
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "Let me work through this.",
+                    "signature": "sig_abc123",
+                },
+                {"type": "text", "text": "The answer is 42."},
+            ],
+        }
+    )
+    msg = AnthropicChatTranslator.from_anthropic(raw).choices[0].message
+    assert msg.content == [TextContent(text="The answer is 42.")]
+    assert msg.text == "The answer is 42."
+    assert msg.reasoning == "Let me work through this."
+    assert msg.reasoning_details == [
+        ReasoningTextDetail(
+            text="Let me work through this.",
+            signature="sig_abc123",
+            format="anthropic-claude-v1",
+        )
+    ]
+
+
+def test_from_anthropic_redacted_thinking_becomes_encrypted_reasoning():
+    """``redacted_thinking`` maps to ``reasoning.encrypted``; it adds no reasoning text."""
+    raw = _message(
+        {"content": [{"type": "redacted_thinking", "data": "opaque-encrypted-data"}]}
+    )
+    msg = AnthropicChatTranslator.from_anthropic(raw).choices[0].message
+    assert msg.content is None
+    assert msg.tool_calls is None
+    assert msg.reasoning is None
+    assert msg.reasoning_details == [
+        ReasoningEncryptedDetail(
+            data="opaque-encrypted-data", format="anthropic-claude-v1"
+        )
+    ]
+
+
+def test_from_anthropic_thinking_and_tool_use():
+    """Thinking ahead of a tool call keeps both the tool call and the reasoning."""
+    raw = _message(
+        {
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "I should check the weather.",
+                    "signature": "sig_xyz",
+                },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_03",
+                    "name": "get_weather",
+                    "input": {"city": "Paris"},
+                },
+            ],
+            "stop_reason": "tool_use",
+        }
+    )
+    msg = AnthropicChatTranslator.from_anthropic(raw).choices[0].message
+    assert msg.content is None
+    assert msg.tool_calls is not None
+    assert msg.tool_calls[0].function.name == "get_weather"
+    assert msg.reasoning == "I should check the weather."
+    assert msg.reasoning_details is not None
+    assert len(msg.reasoning_details) == 1
